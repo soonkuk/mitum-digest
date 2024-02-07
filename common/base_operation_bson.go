@@ -22,6 +22,11 @@ type BaseSignBSONUnmarshaler struct {
 	SignedAt  time.Time      `bson:"signed_at"`
 }
 
+type BaseNodeSignBSONUnmarshaler struct {
+	BaseSignBSONUnmarshaler
+	Node string `bson:"node"`
+}
+
 type BaseOperationBSONUnmarshaler struct {
 	Hint  string     `bson:"_hint"`
 	Hash  string     `bson:"hash"`
@@ -119,6 +124,30 @@ func (op *BaseNodeOperation) DecodeBSON(b []byte, enc *bsonenc.Encoder) error {
 	}
 
 	op.BaseOperation.SetFact(fact)
+
+	var signs []base.Sign
+
+	for i := range u.Signs {
+		var us BaseNodeSignBSONUnmarshaler
+		var pubKey base.Publickey
+		var node base.Address
+		var err error
+		if err = enc.Unmarshal(u.Signs[i], &us); err != nil {
+			return e.Wrap(err)
+		}
+
+		if pubKey, err = base.DecodePublickeyFromString(us.Signer, enc); err != nil {
+			return e.Wrap(err)
+		}
+
+		if node, err = base.DecodeAddress(us.Node, enc); err != nil {
+			return e.Wrap(err)
+		}
+
+		sign := base.NewBaseNodeSign(node, pubKey, us.Signature, us.SignedAt)
+		signs = append(signs, sign)
+	}
+	op.signs = signs
 
 	return nil
 }

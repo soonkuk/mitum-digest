@@ -3,8 +3,6 @@ package digest
 import (
 	"context"
 	"fmt"
-	statecurrency "github.com/ProtoconNet/mitum-currency/v3/state/currency"
-	stateextension "github.com/ProtoconNet/mitum-currency/v3/state/extension"
 	"sync"
 	"time"
 
@@ -12,15 +10,11 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	"github.com/ProtoconNet/mitum-currency/v3/digest/isaac"
 	"github.com/ProtoconNet/mitum2/base"
-	mitumutil "github.com/ProtoconNet/mitum2/util"
 	"github.com/ProtoconNet/mitum2/util/fixedtree"
 )
 
 var bulkWriteLimit = 500
-
-type WriteModelPrepareFunc func(BlockSession, base.State) ([]mongo.WriteModel, error)
 
 type BlockSessioner interface {
 	Prepare() error
@@ -30,44 +24,65 @@ type BlockSessioner interface {
 
 type BlockSession struct {
 	sync.RWMutex
-	block                 base.BlockMap
-	ops                   []base.Operation
-	opsTree               fixedtree.Tree
-	sts                   []base.State
-	st                    *Database
-	proposal              base.ProposalSignFact
-	opsTreeNodes          map[string]base.OperationFixedtreeNode
-	WriteModels           map[string][]mongo.WriteModel
-	WriteModelsFunc       map[string][]mongo.WriteModel
-	blockModels           []mongo.WriteModel
-	operationModels       []mongo.WriteModel
-	accountModels         []mongo.WriteModel
-	contractAccountModels []mongo.WriteModel
-	balanceModels         []mongo.WriteModel
-	currencyModels        []mongo.WriteModel
-	statesValue           *sync.Map
-	balanceAddressList    []string
+	block        base.BlockMap
+	ops          []base.Operation
+	opsTree      fixedtree.Tree
+	sts          []base.State
+	st           *Database
+	proposal     base.ProposalSignFact
+	opsTreeNodes map[string]base.OperationFixedtreeNode
+	WriteModels  map[string][]mongo.WriteModel
+	PrepareFuncs map[string]BlockSessionPrepareFunc
+	HandlerFuncs map[string]BlockSessionHandlerFunc
+	CommitFuncs  map[string]BlockSessionCommitFunc
+	StatesValue  *sync.Map
 }
 
-func NewBlockSession(st *Database, blk base.BlockMap, ops []base.Operation, opsTree fixedtree.Tree, sts []base.State, proposal base.ProposalSignFact) (*BlockSession, error) {
-	if st.Readonly() {
-		return nil, errors.Errorf("readonly mode")
-	}
-
-	nst, err := st.New()
-	if err != nil {
-		return nil, err
-	}
-
+func NewBlockSession() *BlockSession {
 	return &BlockSession{
-		st:          nst,
-		block:       blk,
-		ops:         ops,
-		opsTree:     opsTree,
-		sts:         sts,
-		proposal:    proposal,
-		statesValue: &sync.Map{},
-	}, nil
+		WriteModels:  make(map[string][]mongo.WriteModel),
+		PrepareFuncs: make(map[string]BlockSessionPrepareFunc),
+		HandlerFuncs: make(map[string]BlockSessionHandlerFunc),
+		CommitFuncs:  make(map[string]BlockSessionCommitFunc),
+		StatesValue:  &sync.Map{},
+	}
+}
+
+func (bs *BlockSession) SetPrepareFuncs(prepareFuncs map[string]BlockSessionPrepareFunc) {
+	for k, f := range prepareFuncs {
+		_, found := bs.PrepareFuncs[k]
+		if !found {
+			bs.PrepareFuncs[k] = f
+		}
+	}
+}
+
+func (bs *BlockSession) SetHandlerFuncs(handlerFuncs map[string]BlockSessionHandlerFunc) {
+	for k, f := range handlerFuncs {
+		_, found := bs.HandlerFuncs[k]
+		if !found {
+			bs.HandlerFuncs[k] = f
+		}
+	}
+}
+
+func (bs *BlockSession) SetCommitFuncs(commitFuncs map[string]BlockSessionCommitFunc) {
+	for k, f := range commitFuncs {
+		_, found := bs.CommitFuncs[k]
+		if !found {
+			bs.CommitFuncs[k] = f
+		}
+	}
+}
+
+func (bs *BlockSession) SetWriteModel(modelName string, m []mongo.WriteModel) error {
+	_, found := bs.WriteModels[modelName]
+	if found {
+		return errors.Errorf("%s Writemodel is already registered", modelName)
+	}
+
+	bs.WriteModels[modelName] = m
+	return nil
 }
 
 func (bs *BlockSession) Prepare() error {
@@ -78,62 +93,9 @@ func (bs *BlockSession) Prepare() error {
 		return err
 	}
 
-	if err := bs.prepareBlock(); err != nil {
-		return err
-	}
-
-	if err := bs.prepareOperations(); err != nil {
-		return err
-	}
-
-	if err := bs.prepareCurrencies(); err != nil {
-		return err
-	}
-
-	return bs.prepareAccounts()
-}
-
-func (bs *BlockSession) Commit(ctx context.Context) error {
-	bs.Lock()
-	defer bs.Unlock()
-
-	started := time.Now()
-	defer func() {
-		bs.statesValue.Store("commit", time.Since(started))
-
-		_ = bs.close()
-	}()
-
-	if err := bs.writeModels(ctx, defaultColNameBlock, bs.blockModels); err != nil {
-		return err
-	}
-
-	if len(bs.operationModels) > 0 {
-		if err := bs.writeModels(ctx, defaultColNameOperation, bs.operationModels); err != nil {
-			return err
-		}
-	}
-
-	if len(bs.currencyModels) > 0 {
-		if err := bs.writeModels(ctx, defaultColNameCurrency, bs.currencyModels); err != nil {
-			return err
-		}
-	}
-
-	if len(bs.accountModels) > 0 {
-		if err := bs.writeModels(ctx, defaultColNameAccount, bs.accountModels); err != nil {
-			return err
-		}
-	}
-
-	if len(bs.contractAccountModels) > 0 {
-		if err := bs.writeModels(ctx, defaultColNameContractAccount, bs.contractAccountModels); err != nil {
-			return err
-		}
-	}
-
-	if len(bs.balanceModels) > 0 {
-		if err := bs.writeModels(ctx, defaultColNameBalance, bs.balanceModels); err != nil {
+	for _, f := range bs.PrepareFuncs {
+		err := f(bs)
+		if err != nil {
 			return err
 		}
 	}
@@ -141,11 +103,49 @@ func (bs *BlockSession) Commit(ctx context.Context) error {
 	return nil
 }
 
-func (bs *BlockSession) Close() error {
+func (bs *BlockSession) Database() *Database {
+	return bs.st
+}
+
+func (bs *BlockSession) States() []base.State {
+	return bs.sts
+}
+
+func (bs *BlockSession) BLock() base.BlockMap {
+	return bs.block
+}
+
+func (bs *BlockSession) Commit(ctx context.Context, pool *sync.Pool) error {
 	bs.Lock()
 	defer bs.Unlock()
 
-	return bs.close()
+	started := time.Now()
+	defer func() {
+		bs.StatesValue.Store("commit", time.Since(started))
+
+		_ = bs.close(pool)
+	}()
+
+	for colName, writeModels := range bs.WriteModels {
+		f, found := bs.CommitFuncs[colName]
+		if !found {
+			return errors.Errorf("BlockSessionCommitFunc not found for %s", colName)
+		}
+
+		err := f(bs, ctx, colName, writeModels)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (bs *BlockSession) Close(pool *sync.Pool) error {
+	bs.Lock()
+	defer bs.Unlock()
+
+	return bs.close(pool)
 }
 
 func (bs *BlockSession) prepareOperationsTree() error {
@@ -169,189 +169,10 @@ func (bs *BlockSession) prepareOperationsTree() error {
 	return nil
 }
 
-func (bs *BlockSession) prepareBlock() error {
-	if bs.block == nil {
-		return nil
-	}
-
-	bs.blockModels = make([]mongo.WriteModel, 1)
-
-	manifest := isaac.NewManifest(
-		bs.block.Manifest().Height(),
-		bs.block.Manifest().Previous(),
-		bs.block.Manifest().Proposal(),
-		bs.block.Manifest().OperationsTree(),
-		bs.block.Manifest().StatesTree(),
-		bs.block.Manifest().Suffrage(),
-		bs.block.Manifest().ProposedAt(),
-	)
-
-	doc, err := NewManifestDoc(manifest, bs.st.database.Encoder(), bs.block.Manifest().Height(), bs.ops, bs.block.SignedAt(), bs.proposal.ProposalFact().Proposer(), bs.proposal.ProposalFact().Point().Round())
-	if err != nil {
-		return err
-	}
-	bs.blockModels[0] = mongo.NewInsertOneModel().SetDocument(doc)
-
-	return nil
-}
-
-func (bs *BlockSession) prepareOperations() error {
-	if len(bs.ops) < 1 {
-		return nil
-	}
-
-	node := func(h mitumutil.Hash) (bool, bool, base.OperationProcessReasonError) {
-		no, found := bs.opsTreeNodes[h.String()]
-		if !found {
-			return false, false, nil
-		}
-
-		return true, no.InState(), no.Reason()
-	}
-
-	bs.operationModels = make([]mongo.WriteModel, len(bs.ops))
-
-	for i := range bs.ops {
-		op := bs.ops[i]
-
-		var doc OperationDoc
-		switch found, inState, reason := node(op.Fact().Hash()); {
-		case !found:
-			return mitumutil.ErrNotFound.Errorf("operation, %v in operations tree", op.Fact().Hash().String())
-		default:
-			var reasonMsg string
-			switch {
-			case reason == nil:
-				reasonMsg = ""
-			default:
-				reasonMsg = reason.Msg()
-			}
-			d, err := NewOperationDoc(
-				op,
-				bs.st.database.Encoder(),
-				bs.block.Manifest().Height(),
-				bs.block.SignedAt(),
-				inState,
-				reasonMsg,
-				uint64(i),
-			)
-			if err != nil {
-				return err
-			}
-			doc = d
-		}
-
-		bs.operationModels[i] = mongo.NewInsertOneModel().SetDocument(doc)
-	}
-
-	return nil
-}
-
-func (bs *BlockSession) prepareAccounts() error {
-	if len(bs.sts) < 1 {
-		return nil
-	}
-
-	var accountModels []mongo.WriteModel
-	var balanceModels []mongo.WriteModel
-	var contractAccountModels []mongo.WriteModel
-	for i := range bs.sts {
-		st := bs.sts[i]
-
-		switch {
-		case statecurrency.IsStateAccountKey(st.Key()):
-			j, err := bs.handleAccountState(st)
-			if err != nil {
-				return err
-			}
-			accountModels = append(accountModels, j...)
-		case statecurrency.IsStateBalanceKey(st.Key()):
-			j, address, err := bs.handleBalanceState(st)
-			if err != nil {
-				return err
-			}
-			balanceModels = append(balanceModels, j...)
-			bs.balanceAddressList = append(bs.balanceAddressList, address)
-		case stateextension.IsStateContractAccountKey(st.Key()):
-			j, err := bs.handleContractAccountState(st)
-			if err != nil {
-				return err
-			}
-			contractAccountModels = append(contractAccountModels, j...)
-		default:
-			continue
-		}
-	}
-
-	bs.accountModels = accountModels
-	bs.contractAccountModels = contractAccountModels
-	bs.balanceModels = balanceModels
-	return nil
-}
-
-func (bs *BlockSession) prepareCurrencies() error {
-	if len(bs.sts) < 1 {
-		return nil
-	}
-
-	var currencyModels []mongo.WriteModel
-	for i := range bs.sts {
-		st := bs.sts[i]
-		switch {
-		case statecurrency.IsStateCurrencyDesignKey(st.Key()):
-			j, err := bs.handleCurrencyState(st)
-			if err != nil {
-				return err
-			}
-			currencyModels = append(currencyModels, j...)
-		default:
-			continue
-		}
-	}
-
-	bs.currencyModels = currencyModels
-
-	return nil
-}
-
-func (bs *BlockSession) handleAccountState(st base.State) ([]mongo.WriteModel, error) {
-	if rs, err := NewAccountValue(st); err != nil {
-		return nil, err
-	} else if doc, err := NewAccountDoc(rs, bs.st.database.Encoder()); err != nil {
-		return nil, err
-	} else {
-		return []mongo.WriteModel{mongo.NewInsertOneModel().SetDocument(doc)}, nil
-	}
-}
-
-func (bs *BlockSession) handleBalanceState(st base.State) ([]mongo.WriteModel, string, error) {
-	doc, address, err := NewBalanceDoc(st, bs.st.database.Encoder())
-	if err != nil {
-		return nil, "", err
-	}
-	return []mongo.WriteModel{mongo.NewInsertOneModel().SetDocument(doc)}, address, nil
-}
-
-func (bs *BlockSession) handleContractAccountState(st base.State) ([]mongo.WriteModel, error) {
-	doc, err := NewContractAccountStatusDoc(st, bs.st.database.Encoder())
-	if err != nil {
-		return nil, err
-	}
-	return []mongo.WriteModel{mongo.NewInsertOneModel().SetDocument(doc)}, nil
-}
-
-func (bs *BlockSession) handleCurrencyState(st base.State) ([]mongo.WriteModel, error) {
-	doc, err := NewCurrencyDoc(st, bs.st.database.Encoder())
-	if err != nil {
-		return nil, err
-	}
-	return []mongo.WriteModel{mongo.NewInsertOneModel().SetDocument(doc)}, nil
-}
-
-func (bs *BlockSession) writeModels(ctx context.Context, col string, models []mongo.WriteModel) error {
+func (bs *BlockSession) WriteWriteModels(ctx context.Context, col string, models []mongo.WriteModel) error {
 	started := time.Now()
 	defer func() {
-		bs.statesValue.Store(fmt.Sprintf("write-models-%s", col), time.Since(started))
+		bs.StatesValue.Store(fmt.Sprintf("write-models-%s", col), time.Since(started))
 	}()
 
 	n := len(models)
@@ -392,13 +213,15 @@ func (bs *BlockSession) writeModelsChunk(ctx context.Context, col string, models
 	return nil
 }
 
-func (bs *BlockSession) close() error {
+func (bs *BlockSession) close(pool *sync.Pool) error {
 	bs.block = nil
-	bs.operationModels = nil
-	bs.currencyModels = nil
-	bs.accountModels = nil
-	bs.contractAccountModels = nil
-	bs.balanceModels = nil
+	bs.WriteModels = make(map[string][]mongo.WriteModel)
+	err := bs.st.Close()
+	if err != nil {
+		return err
+	}
 
-	return bs.st.Close()
+	pool.Put(bs)
+
+	return nil
 }

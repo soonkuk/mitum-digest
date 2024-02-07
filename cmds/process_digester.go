@@ -3,6 +3,7 @@ package cmds
 import (
 	"context"
 	"github.com/ProtoconNet/mitum2/isaac"
+	"sync"
 
 	"github.com/ProtoconNet/mitum-currency/v3/digest"
 	"github.com/ProtoconNet/mitum2/base"
@@ -18,6 +19,18 @@ const (
 	PNameDigester      = ps.Name("digester")
 	PNameStartDigester = ps.Name("start_digester")
 )
+
+var blockSessionPool = sync.Pool{
+	New: func() interface{} {
+
+		bs := digest.NewBlockSession()
+		bs.SetPrepareFuncs(digest.PrepareFuncs)
+		bs.SetHandlerFuncs(digest.HandlerFuncs)
+		bs.SetCommitFuncs(digest.CommitFuncs)
+
+		return bs
+	},
+}
 
 func ProcessDigester(ctx context.Context) (context.Context, error) {
 	var log *logging.Logging
@@ -59,8 +72,10 @@ func ProcessDigester(ctx context.Context) (context.Context, error) {
 		sourceReaders = i
 	}
 
-	di := digest.NewDigester(st, root, sourceReaders, fromRemotes, design.NetworkID, nil)
+	di := digest.NewDigester(st, root, sourceReaders, fromRemotes, design.NetworkID, nil, &blockSessionPool)
 	_ = di.SetLogging(log)
+
+	ctx = context.WithValue(ctx, ContextValueBlockSession, &blockSessionPool)
 
 	return context.WithValue(ctx, ContextValueDigester, di), nil
 }
@@ -162,6 +177,11 @@ func digestFollowup(ctx context.Context, height base.Height) error {
 		lastBlock = base.GenesisHeight
 	}
 
+	var bsPool *sync.Pool
+	if err := util.LoadFromContextOK(ctx, ContextValueBlockSession, &bsPool); err != nil {
+		return err
+	}
+
 	for h := lastBlock; h <= height; h++ {
 		var bm base.BlockMap
 
@@ -183,7 +203,7 @@ func digestFollowup(ctx context.Context, height base.Height) error {
 			return err
 		}
 
-		if err := digest.DigestBlock(ctx, st, bm, ops, opsTree, sts, pr); err != nil {
+		if err := digest.DigestBlock(ctx, st, bm, ops, opsTree, sts, pr, bsPool); err != nil {
 			return err
 		}
 

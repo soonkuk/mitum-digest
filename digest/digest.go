@@ -49,13 +49,14 @@ type Digester struct {
 	sync.RWMutex
 	*util.ContextDaemon
 	*logging.Logging
-	database      *Database
-	localfsRoot   string
-	blockChan     chan base.BlockMap
-	errChan       chan error
-	sourceReaders *isaac.BlockItemReaders
-	fromRemotes   isaac.RemotesBlockItemReadFunc
-	networkID     base.NetworkID
+	database         *Database
+	localfsRoot      string
+	blockChan        chan base.BlockMap
+	errChan          chan error
+	blockSessionPool *sync.Pool
+	sourceReaders    *isaac.BlockItemReaders
+	fromRemotes      isaac.RemotesBlockItemReadFunc
+	networkID        base.NetworkID
 }
 
 func NewDigester(
@@ -65,18 +66,20 @@ func NewDigester(
 	fromRemotes isaac.RemotesBlockItemReadFunc,
 	networkID base.NetworkID,
 	errChan chan error,
+	blockSessionPool *sync.Pool,
 ) *Digester {
 	di := &Digester{
 		Logging: logging.NewLogging(func(c zerolog.Context) zerolog.Context {
 			return c.Str("module", "digester")
 		}),
-		database:      st,
-		localfsRoot:   root,
-		blockChan:     make(chan base.BlockMap, 200),
-		errChan:       errChan,
-		sourceReaders: sourceReaders,
-		fromRemotes:   fromRemotes,
-		networkID:     networkID,
+		database:         st,
+		localfsRoot:      root,
+		blockChan:        make(chan base.BlockMap, 200),
+		errChan:          errChan,
+		blockSessionPool: blockSessionPool,
+		sourceReaders:    sourceReaders,
+		fromRemotes:      fromRemotes,
+		networkID:        networkID,
 	}
 
 	di.ContextDaemon = util.NewContextDaemon(di.start)
@@ -167,7 +170,7 @@ func (di *Digester) digest(ctx context.Context, blk base.BlockMap) error {
 		return e.Wrap(err)
 	}
 
-	if err := DigestBlock(ctx, di.database, blk, ops, opsTree, sts, pr); err != nil {
+	if err := DigestBlock(ctx, di.database, blk, ops, opsTree, sts, pr, di.blockSessionPool); err != nil {
 		return e.Wrap(err)
 	}
 
@@ -182,22 +185,33 @@ func DigestBlock(
 	opsTree fixedtree.Tree,
 	sts []base.State,
 	proposal base.ProposalSignFact,
+	blockSessionPool *sync.Pool,
 ) error {
-	if m, _, _, _, _, _ := st.ManifestByHeight(blk.Manifest().Height()); m != nil {
+	if st.lastBlock >= blk.Manifest().Height() {
 		return nil
 	}
 
-	bs, err := NewBlockSession(st, blk, ops, opsTree, sts, proposal)
-	if err != nil {
-		return err
+	nbs := blockSessionPool.Get()
+
+	bs, ok := nbs.(*BlockSession)
+	if !ok {
+		return errors.Errorf("expected %T, not %T", &BlockSession{}, nbs)
 	}
+
+	bs.block = blk
+	bs.ops = ops
+	bs.opsTree = opsTree
+	bs.sts = sts
+	bs.st = st
+	bs.proposal = proposal
+
 	defer func() {
-		_ = bs.Close()
+		_ = bs.Close(blockSessionPool)
 	}()
 
 	if err := bs.Prepare(); err != nil {
 		return err
 	}
 
-	return bs.Commit(ctx)
+	return bs.Commit(ctx, blockSessionPool)
 }

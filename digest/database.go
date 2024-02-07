@@ -100,15 +100,15 @@ func (st *Database) Close() error {
 	return st.database.Close()
 }
 
-func (st *Database) DatabaseClient() *mongodbstorage.Client {
+func (st *Database) Client() *mongodbstorage.Client {
 	return st.database.Client()
 }
 
-func (st *Database) DatabaseEncoder() encoder.Encoder {
+func (st *Database) Encoder() encoder.Encoder {
 	return st.database.Encoder()
 }
 
-func (st *Database) DatabaseEncoders() *encoder.Encoders {
+func (st *Database) Encoders() *encoder.Encoders {
 	return st.database.Encoders()
 }
 
